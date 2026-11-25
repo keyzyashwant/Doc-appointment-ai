@@ -1,0 +1,39 @@
+from functools import lru_cache
+from pathlib import Path
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+BACKEND_DIR = Path(__file__).resolve().parents[2]
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=BACKEND_DIR / ".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    elevenlabs_api_key: str = ""
+    google_api_key: str = ""
+    database_url: str = "sqlite:///./doctor_appointment.db"
+    cors_origins: list[str] = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ]
+
+    @property
+    def sqlalchemy_database_url(self) -> str:
+        url = self.database_url
+        prefix = "sqlite:///"
+        if not url.startswith(prefix):
+            return url
+        location = url[len(prefix) :]
+        if location == ":memory:" or Path(location).is_absolute():
+            return url
+        absolute = (BACKEND_DIR / location).resolve()
+        return f"{prefix}{absolute.as_posix()}"
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
