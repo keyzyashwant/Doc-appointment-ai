@@ -15,6 +15,7 @@ class Settings(BaseSettings):
 
     elevenlabs_api_key: str = ""
     google_api_key: str = ""
+    gemini_model: str = ""
     database_url: str = "sqlite:///./doctor_appointment.db"
     cors_origins: list[str] = [
         "http://localhost:5173",
@@ -32,6 +33,18 @@ class Settings(BaseSettings):
             return url
         absolute = (BACKEND_DIR / location).resolve()
         return f"{prefix}{absolute.as_posix()}"
+
+    def validate_voice_settings(self) -> None:
+        required = {
+            "ELEVENLABS_API_KEY": self.elevenlabs_api_key,
+            "GOOGLE_API_KEY": self.google_api_key,
+            "GEMINI_MODEL": self.gemini_model,
+        }
+        missing = [name for name, value in required.items() if not value.strip()]
+        if missing:
+            raise RuntimeError(
+                f"Missing required voice configuration: {', '.join(missing)}"
+            )
 
 
 @lru_cache

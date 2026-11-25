@@ -25,6 +25,11 @@ def init_database() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging()
+    try:
+        get_settings().validate_voice_settings()
+    except RuntimeError:
+        logger.exception("Voice configuration is incomplete; refusing startup")
+        raise
     init_database()
     logger.info("Database ready")
     yield
@@ -43,11 +48,29 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(AppError)
     async def handle_app_error(_request: Request, exc: AppError) -> JSONResponse:
-        return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
+        body: dict = {"detail": exc.message}
+        if exc.code is not None:
+            body["code"] = exc.code.value
+        return JSONResponse(status_code=exc.status_code, content=body)
 
     @app.get("/api/health")
     def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    # Wire up route modules
+    from app.api.routes import appointments_router, doctors_router, ws_router
+
+    app.include_router(doctors_router)
+    app.include_router(appointments_router)
+    app.include_router(ws_router)
+
+    # Voice/WebRTC signaling (imported lazily — pipecat may not be installed)
+    try:
+        from app.api.routes.offer import router as offer_router
+
+        app.include_router(offer_router)
+    except ImportError:
+        logger.warning("pipecat not installed — /api/offer route disabled")
 
     return app
 
