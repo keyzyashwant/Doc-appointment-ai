@@ -9,6 +9,7 @@ class ErrorCode(str, Enum):
     ALREADY_HAS_APPOINTMENT = "ALREADY_HAS_APPOINTMENT"
     NO_APPOINTMENT_FOUND = "NO_APPOINTMENT_FOUND"
     DOCTOR_NOT_FOUND = "DOCTOR_NOT_FOUND"
+    SPECIALITY_NOT_FOUND = "SPECIALITY_NOT_FOUND"
 
 
 class AppError(Exception):
@@ -33,5 +34,8 @@ class DomainError(AppError):
 
     status_code = 422
 
-    def __init__(self, code: ErrorCode, message: str) -> None:
+    def __init__(
+        self, code: ErrorCode, message: str, data: dict | None = None
+    ) -> None:
         super().__init__(message, code=code)
+        self.data = data or {}

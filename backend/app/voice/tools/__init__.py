@@ -11,17 +11,20 @@ from app.services.availability_service import AvailabilityService
 
 logger = get_logger(__name__)
 
-
 def _ok(message: str, data: dict | None = None) -> dict:
     return {"ok": True, "code": "SUCCESS", "message": message, "data": data or {}}
 
 
-def _fail(code: str, message: str) -> dict:
-    return {"ok": False, "code": code, "message": message, "data": {}}
+def _fail(code: str, message: str, data: dict | None = None) -> dict:
+    return {"ok": False, "code": code, "message": message, "data": data or {}}
 
 
 def _domain_failure(exc: DomainError) -> dict:
-    return _fail(exc.code.value if exc.code else "ERROR", exc.message)
+    return _fail(
+        exc.code.value if exc.code else "ERROR",
+        exc.message,
+        getattr(exc, "data", None),
+    )
 
 
 def _redact_log_values(value):
@@ -122,6 +125,20 @@ async def check_doctor_availability(
     await _send_result(params, result, "check_doctor_availability")
 
 
+def configure_speciality_catalog(specialities: tuple[str, ...]) -> None:
+    names = ", ".join(specialities) or "No specialities are currently available"
+    check_doctor_availability.__doc__ = f"""Find available doctors and up to three upcoming slots per doctor.
+
+Available specialities (exact DB names): {names}.
+Map what the caller says (cardiologist, heart doctor, kids doctor) to one of these names before calling the tool.
+
+Args:
+    doctor_name: Optional part or full doctor name.
+    speciality: Optional medical speciality; use one of the exact names listed above.
+    date: Optional date in YYYY-MM-DD format.
+"""
+
+
 def _book_appointment(slot_id: int, phone_number: str) -> dict:
     try:
         with SessionLocal() as session:
@@ -155,7 +172,7 @@ async def book_appointment(
     Args:
         slot_id: The selected slot ID from availability results.
         phone_number: The caller's confirmed Indian mobile number.
-        phone_confirmed: True only after reading each digit aloud and receiving confirmation.
+        phone_confirmed: True only after reading each digit aloud and receiving a fresh yes.
     """
     logger.info(
         "Voice tool call book_appointment args=%s",
@@ -168,7 +185,10 @@ async def book_appointment(
         ),
     )
     if phone_confirmed is not True:
-        result = _fail("PHONE_NOT_CONFIRMED", "The caller's phone number must be confirmed first.")
+        result = _fail(
+            "PHONE_NOT_CONFIRMED",
+            "Read the phone number back digit by digit and get a new yes before booking.",
+        )
     else:
         try:
             result = await asyncio.to_thread(_book_appointment, slot_id, phone_number)
@@ -209,7 +229,7 @@ async def cancel_appointment(
 
     Args:
         phone_number: The caller's confirmed Indian mobile number.
-        phone_confirmed: True only after reading each digit aloud and receiving confirmation.
+        phone_confirmed: True only after reading each digit aloud and receiving a fresh yes.
         appointment_id: Optional ID of the appointment to cancel.
     """
     logger.info(
@@ -223,7 +243,10 @@ async def cancel_appointment(
         ),
     )
     if phone_confirmed is not True:
-        result = _fail("PHONE_NOT_CONFIRMED", "The caller's phone number must be confirmed first.")
+        result = _fail(
+            "PHONE_NOT_CONFIRMED",
+            "Read the phone number back digit by digit and get a new yes before cancelling.",
+        )
     else:
         try:
             result = await asyncio.to_thread(

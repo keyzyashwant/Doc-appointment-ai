@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     )
 
     elevenlabs_api_key: str = ""
+    elevenlabs_voice_id: str = ""
+    elevenlabs_tts_model: str = "eleven_flash_v2_5"
     google_api_key: str = ""
     gemini_model: str = ""
     database_url: str = "sqlite:///./doctor_appointment.db"
@@ -37,6 +39,7 @@ class Settings(BaseSettings):
     def validate_voice_settings(self) -> None:
         required = {
             "ELEVENLABS_API_KEY": self.elevenlabs_api_key,
+            "ELEVENLABS_VOICE_ID": self.elevenlabs_voice_id,
             "GOOGLE_API_KEY": self.google_api_key,
             "GEMINI_MODEL": self.gemini_model,
         }

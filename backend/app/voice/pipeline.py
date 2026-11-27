@@ -4,6 +4,8 @@ This module exposes ``run_bot(webrtc_connection)`` which is called once per
 WebRTC session from the /api/offer route.
 """
 import asyncio
+import json
+import re
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -16,6 +18,7 @@ from pipecat.frames.frames import (
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMRunFrame,
+    TTSAudioRawFrame,
     TranscriptionFrame,
     TTSStartedFrame,
     TTSStoppedFrame,
@@ -30,18 +33,22 @@ from pipecat.processors.aggregators.llm_response_universal import (
 )
 
 from pipecat.processors.frameworks.rtvi import RTVIObserverParams
-from pipecat.services.elevenlabs.stt import ElevenLabsRealtimeSTTService
+from pipecat.services.elevenlabs.stt import CommitStrategy, ElevenLabsRealtimeSTTService
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.services.google.llm import GoogleLLMService
+from pipecat.transcriptions.language import Language
 from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
+from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.workers.runner import WorkerRunner
 
 from app.core.config import get_settings
 from app.core.database import SessionLocal
 from app.models.call_session import CallSession
 from app.models.enums import CallSessionStatus
-from app.voice.tools import ALL_TOOLS
+from app.core.specialities import get_speciality_catalog
+from app.voice.tools import ALL_TOOLS, configure_speciality_catalog
 
 CLINIC_TZ = ZoneInfo("Asia/Kolkata")
 
@@ -49,6 +56,13 @@ CLINIC_TZ = ZoneInfo("Asia/Kolkata")
 class _PipelineLogObserver(BaseObserver):
     def __init__(self) -> None:
         super().__init__(observe_every_push=False)
+        self._greeting_audio_pending = False
+
+    def expect_greeting_audio(self) -> None:
+        self._greeting_audio_pending = True
+
+    def clear_greeting_audio(self) -> None:
+        self._greeting_audio_pending = False
 
     async def on_push_frame(self, data: FramePushed) -> None:
         frame = data.frame
@@ -60,8 +74,75 @@ class _PipelineLogObserver(BaseObserver):
             logger.info("LLM response ended")
         elif isinstance(frame, TTSStartedFrame):
             logger.info("TTS started")
+        elif isinstance(frame, TTSAudioRawFrame) and frame.audio:
+            if self._greeting_audio_pending:
+                logger.info("Greeting audio started")
+                self._greeting_audio_pending = False
         elif isinstance(frame, TTSStoppedFrame):
             logger.info("TTS stopped")
+
+
+def _log_tts_failure(source: str, error: object, exception: Exception | None = None) -> None:
+    response = getattr(exception, "response", None)
+    http_status = getattr(response, "status_code", None) or getattr(response, "status", None)
+    body = getattr(response, "body", None)
+    if isinstance(body, bytes):
+        body = body.decode("utf-8", errors="replace")
+
+    provider_status = None
+    message = str(error)
+    if body:
+        try:
+            payload = json.loads(body)
+        except (TypeError, ValueError):
+            payload = None
+        if isinstance(payload, dict):
+            detail = payload.get("detail", payload)
+            if isinstance(detail, dict):
+                provider_status = detail.get("status") or detail.get("code")
+                message = detail.get("message") or payload.get("message") or str(detail)
+            elif detail:
+                message = str(detail)
+        else:
+            message = str(body)
+
+    error_text = " ".join(part for part in (str(error), str(exception or "")) if part)
+    if http_status is None:
+        match = re.search(r"\bHTTP(?:\s+status)?\s*[:=]?\s*(\d{3})\b", error_text, re.I)
+        if match:
+            http_status = match.group(1)
+    if provider_status is None:
+        match = re.search(
+            r"\b(paid_plan_required|invalid[_ ]voice|quota[_ ](?:exceeded|limit))\b",
+            error_text,
+            re.I,
+        )
+        if match:
+            provider_status = match.group(1)
+
+    logger.error(
+        "ElevenLabs TTS failure source={} http_status={} provider_status={} message={} exception={}",
+        source,
+        http_status or "unknown",
+        provider_status or "unknown",
+        message,
+        str(exception) if exception else "none",
+    )
+
+
+def _verify_voice_tool_handlers(context: LLMContext) -> list[str]:
+    direct_functions = getattr(context.tools, "direct_functions", ())
+    handlers = {tool.name: tool.function for tool in direct_functions}
+    expected_names = [tool.__name__ for tool in ALL_TOOLS]
+    if len(set(expected_names)) != len(expected_names):
+        raise RuntimeError("Voice tools in ALL_TOOLS must have unique names")
+    missing = [tool.__name__ for tool in ALL_TOOLS if handlers.get(tool.__name__) is not tool]
+    if missing:
+        raise RuntimeError(
+            "Voice tools are missing registered handlers in LLMContext: "
+            + ", ".join(missing)
+        )
+    return expected_names
 
 
 def _start_call_session() -> int:
@@ -91,6 +172,7 @@ def _system_prompt() -> str:
     now = datetime.now(CLINIC_TZ)
     today = now.strftime("%A, %B %d, %Y")
     time_str = now.strftime("%I:%M %p")
+    specialities = ", ".join(get_speciality_catalog()) or "None loaded"
 
     return f"""\
 You are the voice receptionist for a multi-speciality medical clinic.
@@ -98,29 +180,39 @@ Today is {today}. The current time is {time_str} Asia/Kolkata (IST).
 
 CAPABILITIES:
 • Check doctor availability by name, speciality, or date.
+• Exact DB specialities: {specialities}. Map what the caller says (cardiologist, heart doctor, kids doctor) to one of these names before calling the tool.
 • Book an appointment for a patient.
 • Cancel a patient's existing appointment.
 
 RULES — follow these strictly:
 1. IDENTITY: You handle appointments only. For medical questions, say:
    "I can only help with scheduling. Please consult a doctor for medical advice."
-2. PHONE VERIFICATION: Before booking or cancelling, ask for the caller's
-    10-digit Indian mobile number. Read each digit aloud individually, then ask
-    for verbal confirmation. Only then call the tool with phone_confirmed=true.
-3. ONE APPOINTMENT: Each phone can have only one active appointment. If the patient
-   already has one, let them know and offer to cancel first.
-4. SLOT CONFIRMATION: After finding slots, clearly state the doctor name, date,
-   and time before booking. Get the patient's confirmation.
-5. PAST SLOTS: Never attempt to book a slot in the past.
-6. CONCISENESS: Use short spoken sentences. Avoid long lists and offer at most
-    3 available slots.
+2. TURN STYLE: The caller has already been greeted. Do not greet them again.
+    Ask only one question per turn and keep sentences short.
+3. BOOKING FLOW: First ask which doctor or speciality they need. As soon as
+    they answer, call check_doctor_availability with the information they gave;
+    do not ask another question first. Offer no more than 3 available slots.
+    Ask them to choose one. After they choose, say the doctor, date, and time
+    aloud and ask them to confirm that exact slot. Only after they confirm it,
+    ask for their 10-digit Indian mobile number. Read the number back one digit
+    at a time and ask if that number is correct. Wait for a new, clear yes
+    after the readback. The earlier yes that confirmed the slot does not confirm
+    the phone number. Only then call book_appointment with phone_confirmed=true.
+    State the booking result based on the tool response.
+4. CANCELLATION FLOW: Ask for their 10-digit Indian mobile number. Read it
+    back one digit at a time and ask if that number is correct. Wait for a new,
+    clear yes after the readback. Only then call cancel_appointment with
+    phone_confirmed=true.
+5. ONE APPOINTMENT: Each phone can have only one active appointment. If the
+    caller already has one, explain this briefly and offer cancellation.
+6. PAST SLOTS: Never attempt to book a slot in the past.
 7. POLITENESS: Be warm, professional, and helpful at all times.
-8. ERRORS: If a tool returns an error, explain the issue to the patient in
-   simple language and suggest what they can do (e.g. pick another slot).
+8. ERRORS: If a tool returns an error, explain the issue simply and suggest
+    what the caller can do next.
 9. NO HALLUCINATION: Only provide information returned by your tools. Never
-   invent doctor names, times, or appointment IDs.
+    invent doctor names, times, or appointment IDs.
 10. BOOKING CLAIMS: Never say an appointment is booked unless the booking tool
-    returned ok=true. If it returns ok=false, clearly say it was not booked.
+     returned ok=true. If it returns ok=false, clearly say it was not booked.
 """
 
 
@@ -130,6 +222,7 @@ async def run_bot(webrtc_connection) -> None:
     """Create and run the full voice pipeline for one WebRTC session."""
     settings = get_settings()
     settings.validate_voice_settings()
+    configure_speciality_catalog(get_speciality_catalog())
 
     # -- Transport --
     transport = SmallWebRTCTransport(
@@ -143,6 +236,11 @@ async def run_bot(webrtc_connection) -> None:
     # -- STT (ElevenLabs Realtime) --
     stt = ElevenLabsRealtimeSTTService(
         api_key=settings.elevenlabs_api_key,
+        commit_strategy=CommitStrategy.VAD,
+        settings=ElevenLabsRealtimeSTTService.Settings(
+            language=Language.EN,
+            vad_silence_threshold_secs=0.6,
+        ),
     )
 
     # -- LLM (Gemini) --
@@ -157,8 +255,8 @@ async def run_bot(webrtc_connection) -> None:
     tts = ElevenLabsTTSService(
         api_key=settings.elevenlabs_api_key,
         settings=ElevenLabsTTSService.Settings(
-            voice="b5RPB35vTODb3BEmR3Fc",   # Serein
-            model="eleven_turbo_v2_5",      # from eleven_turbo_v2
+            voice=settings.elevenlabs_voice_id,
+            model=settings.elevenlabs_tts_model,
         ),
     )
 
@@ -167,12 +265,16 @@ async def run_bot(webrtc_connection) -> None:
         messages=[{"role": "system", "content": _system_prompt()}],
         tools=ALL_TOOLS,
     )
+    logger.info("LLM direct-function tool handlers ready: {}", _verify_voice_tool_handlers(context))
 
     # -- Context aggregator pair (VAD lives here) --
     context_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
-            vad_analyzer=SileroVADAnalyzer(params=VADParams())
+            vad_analyzer=SileroVADAnalyzer(params=VADParams(min_volume=0.35)),
+            user_turn_strategies=UserTurnStrategies(
+                stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.6)],
+            ),
         ),
     )
 
@@ -187,6 +289,7 @@ async def run_bot(webrtc_connection) -> None:
         context_aggregator.assistant(),
     ])
 
+    pipeline_log_observer = _PipelineLogObserver()
     worker = PipelineWorker(
         pipeline,
         params=PipelineParams(enable_metrics=True),
@@ -195,7 +298,7 @@ async def run_bot(webrtc_connection) -> None:
             user_input_enabled=True,
             bot_output_enabled=True,
         ),
-        observers=[_PipelineLogObserver()],
+        observers=[pipeline_log_observer],
     )
     runner = WorkerRunner(handle_sigint=False)
     await runner.add_workers(worker)
@@ -217,6 +320,7 @@ async def run_bot(webrtc_connection) -> None:
     @worker.rtvi.event_handler("on_client_ready")
     async def on_client_ready(rtvi):
         logger.info("RTVI client ready; starting greeting turn")
+        pipeline_log_observer.expect_greeting_audio()
         context.add_message(
             {
                 "role": "developer",
@@ -235,7 +339,8 @@ async def run_bot(webrtc_connection) -> None:
             except Exception:
                 logger.exception("Could not end call session")
             call_session_id = None
-        await runner.cancel()
+        await worker.cancel(reason="WebRTC client disconnected")
+        await runner.cancel(reason="WebRTC client disconnected")
 
     @stt.event_handler("on_connection_error")
     async def on_stt_connection_error(service, error):
@@ -243,7 +348,7 @@ async def run_bot(webrtc_connection) -> None:
 
     @tts.event_handler("on_connection_error")
     async def on_tts_connection_error(service, error):
-        logger.info("TTS service error: {}", error)
+        _log_tts_failure("connection", error)
 
     @llm.event_handler("on_completion_timeout")
     async def on_llm_completion_timeout(service):
@@ -252,11 +357,12 @@ async def run_bot(webrtc_connection) -> None:
     @worker.event_handler("on_pipeline_error")
     async def on_pipeline_error(worker, frame: ErrorFrame):
         processor = getattr(frame, "processor", None)
-        logger.info(
-            "Pipeline service error from {}: {}",
-            getattr(processor, "name", "unknown"),
-            frame.error,
-        )
+        processor_name = getattr(processor, "name", "unknown")
+        if processor is tts or "elevenlabsttsservice" in processor_name.lower():
+            _log_tts_failure("ErrorFrame", frame.error, frame.exception)
+            pipeline_log_observer.clear_greeting_audio()
+        else:
+            logger.error("Pipeline service error from {}: {}", processor_name, frame.error)
 
     # -- Run --
     await runner.run()

@@ -17,3 +17,7 @@ dist-ssr/
 
 .cursor
 scrap.txt
+backend/bench_llm.py
+backend/list_voices.py
+backend/check_keys.py
+backend/.env.example

@@ -8,6 +8,8 @@ from app.core.config import get_settings
 from app.core.database import Base, SessionLocal, engine
 from app.core.exceptions import AppError
 from app.core.logging import configure_logging, get_logger
+from app.core.specialities import set_speciality_catalog
+from app.repositories.doctor_repo import DoctorRepository
 from app.seed import seed_database
 
 logger = get_logger(__name__)
@@ -20,6 +22,7 @@ def init_database() -> None:
     with SessionLocal() as session:
         seed_database(session)
         session.commit()
+        set_speciality_catalog(DoctorRepository(session).list_specialities())
 
 
 @asynccontextmanager

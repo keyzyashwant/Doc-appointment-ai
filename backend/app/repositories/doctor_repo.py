@@ -13,6 +13,13 @@ class DoctorRepository:
     def list_all(self) -> list[Doctor]:
         return list(self._session.scalars(select(Doctor).order_by(Doctor.name)))
 
+    def list_specialities(self) -> list[str]:
+        return list(
+            self._session.scalars(
+                select(Doctor.speciality).distinct().order_by(Doctor.speciality)
+            )
+        )
+
     def get_by_id(self, doctor_id: int) -> Doctor | None:
         return self._session.get(Doctor, doctor_id)
 

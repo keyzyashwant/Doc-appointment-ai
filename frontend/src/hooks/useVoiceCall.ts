@@ -36,13 +36,24 @@ function connectionErrorMessage(error: unknown): string {
 export function useVoiceCall() {
   const clientRef = useRef<PipecatClient | null>(null);
   const remoteAudioRef = useRef<HTMLAudioElement>(null);
-  const remoteStreamRef = useRef<MediaStream | null>(null);
+  const remoteAudioTrackRef = useRef<MediaStreamTrack | null>(null);
+  const disconnectRequestedRef = useRef(false);
   const startedAtRef = useRef<number | null>(null);
   const [status, setStatus] = useState<VoiceCallStatus>("idle");
   const [muted, setMuted] = useState(false);
   const [durationSeconds, setDurationSeconds] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
+
+  const attachBotAudioTrack = (track: MediaStreamTrack) => {
+    remoteAudioTrackRef.current = track;
+    const audio = remoteAudioRef.current;
+    if (!audio) return;
+
+    audio.srcObject = new MediaStream([track]);
+    void audio.play().catch(console.error);
+    console.info("bot audio track attached");
+  };
 
   const addTranscript = (
     role: TranscriptEntry["role"],
@@ -87,7 +98,7 @@ export function useVoiceCall() {
     }
     setMuted(false);
     setStatus((current) => (current === "error" ? "error" : "ended"));
-    remoteStreamRef.current = null;
+    remoteAudioTrackRef.current = null;
     if (remoteAudioRef.current) {
       remoteAudioRef.current.pause();
       remoteAudioRef.current.srcObject = null;
@@ -102,18 +113,14 @@ export function useVoiceCall() {
     setMuted(false);
     setDurationSeconds(0);
     startedAtRef.current = null;
+    disconnectRequestedRef.current = false;
     setStatus("connecting");
 
-    const remoteStream = new MediaStream();
-    remoteStreamRef.current = remoteStream;
     const remoteAudio = remoteAudioRef.current;
     if (remoteAudio) {
-      remoteAudio.srcObject = remoteStream;
+      remoteAudio.srcObject = new MediaStream();
       remoteAudio.muted = false;
-      void remoteAudio.play().then(
-        () => console.info("[voice] remote audio playback unlocked from call click"),
-        (playError: unknown) => console.warn("[voice] initial audio play failed", playError),
-      );
+      void remoteAudio.play().catch(console.error);
     }
 
     const transport = new SmallWebRTCTransport({
@@ -130,12 +137,19 @@ export function useVoiceCall() {
         },
         onDisconnected: () => {
           console.info("[voice] client disconnected");
+          if (!disconnectRequestedRef.current) {
+            setError("The voice connection was lost. Start a new call to try again.");
+            setStatus("error");
+          }
           finishCall();
         },
         onError: (message) => {
           console.error("[voice] client error", message);
-          setError("The voice connection encountered an error. Check the backend and try again.");
-          setStatus("error");
+          const errorData = message.data as { fatal?: boolean; error?: string };
+          if (errorData.fatal) {
+            setError(errorData.error || "The voice connection encountered a fatal error.");
+            setStatus("error");
+          }
         },
         onTransportStateChanged: (transportState) => {
           console.info("[voice] transport state", transportState);
@@ -154,23 +168,8 @@ export function useVoiceCall() {
             readyState: track.readyState,
             participant,
           });
-          if (track.kind !== "audio" || participant?.local !== false) return;
-
-          const stream = remoteStreamRef.current ?? new MediaStream();
-          remoteStreamRef.current = stream;
-          if (!stream.getTracks().some((existingTrack) => existingTrack.id === track.id)) {
-            stream.addTrack(track);
-          }
-          const audio = remoteAudioRef.current;
-          if (!audio) {
-            console.error("[voice] remote audio element is missing");
-            return;
-          }
-          audio.srcObject = stream;
-          void audio.play().then(
-            () => console.info("[voice] remote audio playback started"),
-            (playError: unknown) => console.error("[voice] remote audio playback failed", playError),
-          );
+          if (track.kind !== "audio" || participant?.local) return;
+          attachBotAudioTrack(track);
         },
         onTrackStopped: (track, participant) => {
           console.info("[voice] track stopped", {
@@ -178,8 +177,14 @@ export function useVoiceCall() {
             id: track.id,
             participant,
           });
-          if (track.kind === "audio" && participant?.local === false) {
-            remoteStreamRef.current?.removeTrack(track);
+          if (track.kind === "audio" && !participant?.local) {
+            if (remoteAudioTrackRef.current?.id === track.id) {
+              remoteAudioTrackRef.current = null;
+              if (remoteAudioRef.current) {
+                remoteAudioRef.current.pause();
+                remoteAudioRef.current.srcObject = null;
+              }
+            }
           }
         },
         onUserInput: (data) => {
@@ -203,11 +208,14 @@ export function useVoiceCall() {
     try {
       await client.connect();
       console.info("[voice] connect() resolved");
+      const botAudioTrack = client.tracks().bot?.audio;
+      if (botAudioTrack) attachBotAudioTrack(botAudioTrack);
       startedAtRef.current ??= Date.now();
       setStatus("connected");
     } catch (connectError) {
       console.error("[voice] connect() failed", connectError);
       clientRef.current = null;
+      disconnectRequestedRef.current = true;
       await client.disconnect().catch(() => undefined);
       setError(connectionErrorMessage(connectError));
       setStatus("error");
@@ -222,6 +230,7 @@ export function useVoiceCall() {
     }
 
     clientRef.current = null;
+    disconnectRequestedRef.current = true;
     try {
       await client.disconnect();
     } catch {
@@ -251,6 +260,14 @@ export function useVoiceCall() {
     const interval = window.setInterval(updateDuration, 1000);
     return () => window.clearInterval(interval);
   }, [status]);
+
+  useEffect(
+    () => {
+      const track = remoteAudioTrackRef.current;
+      if (track) attachBotAudioTrack(track);
+    },
+    [],
+  );
 
   useEffect(
     () => () => {

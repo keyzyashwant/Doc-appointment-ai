@@ -1,6 +1,8 @@
 """Availability service – finding doctors and their free slots."""
 
-from datetime import datetime, timezone
+from difflib import get_close_matches
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from sqlalchemy.orm import Session
 
@@ -10,6 +12,17 @@ from app.models.enums import SlotStatus
 from app.repositories.doctor_repo import DoctorRepository
 from app.repositories.slot_repo import SlotRepository
 from app.schemas import DoctorOut, SlotOut
+
+CLINIC_TZ = ZoneInfo("Asia/Kolkata")
+
+
+def _normalize_speciality(value: str) -> str:
+    normalized = " ".join(value.casefold().split())
+    if normalized.endswith("ologist"):
+        return normalized[:-7] + "ology"
+    if normalized.endswith("ician"):
+        return normalized[:-5] + "ics"
+    return normalized
 
 
 class AvailabilityService:
@@ -30,7 +43,25 @@ class AvailabilityService:
         if doctor_name:
             doctors = self._doctors.search_by_name(doctor_name)
         elif speciality:
-            doctors = self._doctors.search_by_speciality(speciality)
+            specialities = self._doctors.list_specialities()
+            normalized_speciality = _normalize_speciality(speciality)
+            normalized_catalog = {
+                _normalize_speciality(item): item for item in specialities
+            }
+            matches = get_close_matches(
+                normalized_speciality,
+                list(normalized_catalog),
+                n=1,
+                cutoff=0.6,
+            )
+            if not matches:
+                raise DomainError(
+                    ErrorCode.SPECIALITY_NOT_FOUND,
+                    "No matching speciality was found.",
+                    data={"valid_specialities": specialities},
+                )
+            search_term = normalized_catalog[matches[0]]
+            doctors = self._doctors.search_by_speciality(search_term)
         else:
             doctors = self._doctors.list_all()
 
@@ -40,7 +71,7 @@ class AvailabilityService:
                 f"No doctors found matching the search criteria.",
             )
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(CLINIC_TZ)
         result: list[DoctorOut] = []
         for doc in doctors:
             slots = self._slots.available_for_doctor(
